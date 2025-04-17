@@ -273,10 +273,10 @@ def latent_space_interpolation(model, smiles1, smiles2, num_points=10, property_
     model.eval()
     with torch.no_grad():
         # Get latent representations
-        mu1, _ = model.encoder(
+        z_mean1, _ = model.encoder(
             graph1["x"], graph1["edge_index"], graph1["edge_attr"], graph1["batch"]
         )
-        mu2, _ = model.encoder(
+        z_mean2, _ = model.encoder(
             graph2["x"], graph2["edge_index"], graph2["edge_attr"], graph2["batch"]
         )
 
@@ -286,7 +286,7 @@ def latent_space_interpolation(model, smiles1, smiles2, num_points=10, property_
         properties = []
 
         for alpha in alphas:
-            z = (1 - alpha) * mu1 + alpha * mu2
+            z = (1 - alpha) * z_mean1 + alpha * z_mean2
             interpolated_z.append(z.cpu().numpy())
 
             # Predict property if available

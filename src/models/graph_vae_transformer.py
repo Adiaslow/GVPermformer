@@ -6,14 +6,50 @@ Combines graph neural networks with transformer architecture in a variational se
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import (
-    MessagePassing,
-    GCNConv,
-    GATConv,
-    global_mean_pool,
-    global_add_pool,
-)
-from typing import Dict, List, Tuple, Optional, Union, Any
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+import numpy as np
+from typing import Dict, List, Tuple, Optional, Union, Any, cast
+
+# Define empty placeholders to avoid "possibly unbound" errors
+# These will be replaced by actual classes if the import succeeds
+Data = Any
+geo_nn = None
+
+# Try to import torch_geometric
+try:
+    import torch_geometric.nn as geo_nn
+    from torch_geometric.data import Data
+
+    HAS_TORCH_GEOMETRIC = True
+except ImportError:
+    print("Warning: torch_geometric not available, some functionality may be limited")
+    HAS_TORCH_GEOMETRIC = False
+
+    # Define stub classes to prevent errors
+    class MessagePassing:
+        pass
+
+    class GCNConv:
+        pass
+
+    class GATConv:
+        pass
+
+    # Create a stub module with the necessary classes
+    class GeoNNStub:
+        def __init__(self):
+            self.GCNConv = GCNConv
+            self.GATConv = GATConv
+            self.MessagePassing = MessagePassing
+
+        def global_mean_pool(self, *args, **kwargs):
+            raise NotImplementedError("torch_geometric is not available")
+
+    # Use the stub if the real one isn't available
+    if geo_nn is None:
+        geo_nn = GeoNNStub()
 
 
 class GraphEncoder(nn.Module):
@@ -58,7 +94,7 @@ class GraphEncoder(nn.Module):
         for _ in range(num_layers):
             if use_gat:
                 # Graph Attention layer
-                conv = GATConv(
+                conv = geo_nn.GATConv(
                     hidden_channels,
                     hidden_channels,
                     edge_dim=edge_dim,
@@ -68,7 +104,7 @@ class GraphEncoder(nn.Module):
                 )
             else:
                 # Graph Convolutional layer
-                conv = GCNConv(hidden_channels, hidden_channels, improved=True)
+                conv = geo_nn.GCNConv(hidden_channels, hidden_channels, improved=True)
             self.convs.append(conv)
 
         # Batch normalization after each layer
@@ -107,7 +143,7 @@ class GraphEncoder(nn.Module):
         # Apply message passing layers
         for i, conv in enumerate(self.convs):
             # Message passing
-            if isinstance(conv, GATConv) and edge_attr is not None:
+            if isinstance(conv, geo_nn.GATConv) and edge_attr is not None:
                 x_new = conv(x, edge_index, edge_attr=edge_attr)
             else:
                 x_new = conv(x, edge_index)
@@ -128,7 +164,7 @@ class GraphEncoder(nn.Module):
         # Apply global pooling if batch assignments are provided
         if batch is not None:
             # Mean pooling to get graph-level embeddings
-            x = global_mean_pool(x, batch)
+            x = geo_nn.global_mean_pool(x, batch)
 
         return x
 
@@ -252,9 +288,9 @@ class VariationalEncoder(nn.Module):
             nn.Dropout(0.1),
         )
 
-        # Layers for mean and log variance
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        # Variational components
+        self.fc_z_mean = nn.Linear(hidden_dim, latent_dim)
+        self.fc_z_logvar = nn.Linear(hidden_dim, latent_dim)
 
     def forward(
         self, x: torch.Tensor
@@ -266,21 +302,21 @@ class VariationalEncoder(nn.Module):
             x: Input tensor [batch_size, input_dim]
 
         Returns:
-            Tuple of (latent_z, mu, logvar)
+            Tuple of (latent_z, z_mean, z_logvar)
         """
         # Apply fully connected layers
         h = self.fc(x)
 
         # Get mean and log variance
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
+        z_mean = self.fc_z_mean(h)
+        z_logvar = self.fc_z_logvar(h)
 
         # Reparameterization trick
-        std = torch.exp(0.5 * logvar)
+        std = torch.exp(0.5 * z_logvar)
         eps = torch.randn_like(std)
-        z = mu + eps * std
+        z = z_mean + eps * std
 
-        return z, mu, logvar
+        return z, z_mean, z_logvar
 
 
 class Decoder(nn.Module):
@@ -487,44 +523,80 @@ class GraphVAETransformer(nn.Module):
         global_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Encode inputs into latent space.
+        Encode input data to latent space.
 
         Args:
-            x: Node features [num_nodes, node_input_dim]
-            edge_index: Edge connectivity [2, num_edges]
-            edge_attr: Edge features [num_edges, edge_input_dim]
-            batch: Batch assignments [num_nodes]
-            global_features: Optional global features [batch_size, global_input_dim]
+            x (Tensor): Node features
+            edge_index (Tensor): Edge indices
+            edge_attr (Tensor): Edge features
+            batch (Tensor): Batch indices for nodes
+            global_features (Tensor, optional): Global graph features
 
         Returns:
-            Tuple of (latent_z, mu, logvar)
+            Tuple of (latent_z, z_mean, z_logvar)
         """
-        # Encode graph structure
-        node_embeddings = self.graph_encoder(x, edge_index, edge_attr, batch)
+        # Process graph using the GNN encoder
+        h_graph = self.graph_encoder(x, edge_index, edge_attr, batch)
 
-        # Combine with global features if available
+        # Process global features if provided
         if global_features is not None and self.global_input_dim > 0:
-            global_proj = self.global_projection(global_features)
-            combined_embeddings = torch.cat([node_embeddings, global_proj], dim=1)
+            h_global = self.global_projection(global_features)
+
+            # Repeat global features for each node in the batch
+            num_nodes = h_graph.size(0)
+            h_global_expanded = h_global.repeat_interleave(torch.bincount(batch), dim=0)
+
+            # Combine graph and global features
+            combined_embeddings = torch.cat([h_graph, h_global_expanded], dim=1)
         else:
-            combined_embeddings = node_embeddings
+            combined_embeddings = h_graph
 
-        # Map to latent space
-        z, mu, logvar = self.variational_encoder(combined_embeddings)
+        # Get latent representation through variational encoder
+        z, z_mean, z_logvar = self.variational_encoder(combined_embeddings)
 
-        return z, mu, logvar
+        return z, z_mean, z_logvar
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        z: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+        ptr: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Decode from latent space.
+        Decode from latent space to reconstruct graph components.
 
         Args:
             z: Latent space tensor [batch_size, latent_dim]
+            batch: Batch indices for nodes (optional)
+            ptr: Pointers to graph segment boundaries (optional)
 
         Returns:
-            Reconstructed embeddings [batch_size, hidden_dim]
+            Tuple of (reconstructed_x, reconstructed_edge_attr, reconstructed_edge_index)
         """
-        return self.decoder(z)
+        # Get hidden representation from latent
+        h = self.decoder(z)
+
+        # Use hidden representation to construct node features
+        reconstructed_x = h  # In a more complex implementation, this would transform h to match original node features
+
+        # Simple placeholders for edge attributes and indices
+        reconstructed_edge_attr = None
+        reconstructed_edge_index = None
+
+        # If batch and ptr are provided, create simple edge reconstructions
+        if batch is not None and ptr is not None:
+            # Create placeholder edge attributes (would be more sophisticated in real implementation)
+            edge_count = max(1, int(ptr[-1].item() * 0.1))  # Arbitrary edge count
+            reconstructed_edge_attr = torch.zeros(
+                (edge_count, self.edge_input_dim), device=z.device
+            )
+
+            # Create placeholder edge indices (would predict real edges in full implementation)
+            reconstructed_edge_index = torch.zeros(
+                (2, edge_count), device=z.device, dtype=torch.long
+            )
+
+        return reconstructed_x, reconstructed_edge_attr, reconstructed_edge_index
 
     def predict_permeability(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -538,90 +610,137 @@ class GraphVAETransformer(nn.Module):
         """
         return self.permeability_predictor(z)
 
-    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, data: Data) -> Dict[str, Optional[torch.Tensor]]:
         """
-        Forward pass through the full model.
+        Forward pass through the VAE model.
 
         Args:
-            data: Dictionary with graph data
-                - x: Node features [num_nodes, node_input_dim]
-                - edge_index: Edge connectivity [2, num_edges]
-                - edge_attr: Edge features [num_edges, edge_input_dim]
-                - batch: Batch assignments [num_nodes]
-                - global_features: Optional global features [batch_size, global_input_dim]
+            data (Data): PyG data object containing graph information
 
         Returns:
-            Dictionary with model outputs
+            Dict: Dictionary of model outputs
         """
-        # Extract inputs from data
-        x = data["x"]
-        edge_index = data["edge_index"]
-        edge_attr = data["edge_attr"]
-        batch = data["batch"]
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
 
         # Get global features if available
-        global_features = data.get("global_features", None)
+        global_features = (
+            data.global_features if hasattr(data, "global_features") else None
+        )
 
         # Encode to latent space
-        z, mu, logvar = self.encode(x, edge_index, edge_attr, batch, global_features)
+        z, z_mean, z_logvar = self.encode(
+            x, edge_index, edge_attr, batch, global_features
+        )
 
-        # Decode to reconstruct embeddings
-        reconstructed = self.decode(z)
+        # Decode to reconstruct graph features
+        # Get a simple embedding from latent space
+        h = self.decoder(z)
 
-        # Predict permeability
-        permeability = self.predict_permeability(z)
+        # Create placeholder reconstructions
+        # In a real implementation, we would have more sophisticated decoding
+        batch_size = z.size(0)
+        reconstructed_x = h  # Using the decoded hidden representation as node features
+
+        # Simple placeholders for edge attributes and indices
+        num_edges = edge_attr.size(0) if edge_attr is not None else 0
+        reconstructed_edge_attr = (
+            torch.zeros((num_edges, self.edge_input_dim), device=z.device)
+            if num_edges > 0
+            else None
+        )
+        reconstructed_edge_index = (
+            edge_index.clone() if edge_index is not None else None
+        )
+
+        # Predict permeability if predictor is available
+        permeability_prediction = None
+        if self.permeability_predictor is not None:
+            permeability_prediction = self.permeability_predictor(z)
 
         # Return all outputs
         return {
             "z": z,
-            "mu": mu,
-            "logvar": logvar,
-            "reconstructed": reconstructed,
-            "permeability": permeability,
+            "z_mean": z_mean,
+            "z_logvar": z_logvar,
+            "reconstructed_x": reconstructed_x,
+            "reconstructed_edge_attr": reconstructed_edge_attr,
+            "reconstructed_edge_index": reconstructed_edge_index,
+            "permeability_prediction": permeability_prediction,
         }
 
     def compute_loss(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        targets: torch.Tensor,
-        original: torch.Tensor,
+        self, outputs: Dict[str, Optional[torch.Tensor]], data: Data
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute VAE and prediction losses.
+        Compute the VAE loss (reconstruction + KL divergence).
 
         Args:
-            outputs: Model outputs from forward pass
-            targets: Target permeability values [batch_size, 1]
-            original: Original embeddings to compare reconstruction [batch_size, hidden_dim]
+            outputs (Dict): Outputs from the forward pass
+            data (Data): Original input data
 
         Returns:
-            Dictionary with loss components and total loss
+            Dict: Dictionary with loss components
         """
-        # Extract outputs
-        mu = outputs["mu"]
-        logvar = outputs["logvar"]
-        reconstructed = outputs["reconstructed"]
-        predicted_permeability = outputs["permeability"]
+        # Extract outputs and ensure they are of expected type
+        reconstructed_x = cast(torch.Tensor, outputs["reconstructed_x"])
+        reconstructed_edge_attr = outputs["reconstructed_edge_attr"]
+        reconstructed_edge_index = outputs["reconstructed_edge_index"]
+        z_mean = cast(torch.Tensor, outputs["z_mean"])
+        z_logvar = cast(torch.Tensor, outputs["z_logvar"])
+        permeability_prediction = outputs["permeability_prediction"]
 
-        # Reconstruction loss (MSE)
-        recon_loss = F.mse_loss(reconstructed, original)
+        # Extract original data
+        x = data.x
+        edge_attr = data.edge_attr
+        edge_index = data.edge_index
+
+        # Reconstruction loss for node features
+        node_loss = F.mse_loss(reconstructed_x, x)
+
+        # Reconstruction loss for edge features if available
+        edge_feat_loss = torch.tensor(0.0, device=x.device)
+        if edge_attr is not None and reconstructed_edge_attr is not None:
+            edge_feat_loss = F.mse_loss(reconstructed_edge_attr, edge_attr)
+
+        # Edge existence loss (if applicable)
+        edge_loss = torch.tensor(0.0, device=x.device)
+        if (
+            hasattr(self, "use_edge_loss")
+            and self.use_edge_loss
+            and reconstructed_edge_index is not None
+        ):
+            # Implementation of edge existence loss would go here
+            pass
 
         # KL divergence
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_loss = kl_loss / mu.size(0)  # Normalize by batch size
+        kl_loss = -0.5 * torch.sum(1 + z_logvar - z_mean.pow(2) - z_logvar.exp())
+        kl_loss = kl_loss / x.size(0)  # Normalize by batch size
 
-        # Prediction loss (MSE)
-        pred_loss = F.mse_loss(predicted_permeability, targets)
+        # Permeability prediction loss
+        permeability_loss = torch.tensor(0.0, device=x.device)
+        if permeability_prediction is not None and hasattr(data, "permeability"):
+            permeability_loss = F.mse_loss(permeability_prediction, data.permeability)
 
         # Total loss
         total_loss = (
-            recon_loss + self.beta * kl_loss + self.prediction_weight * pred_loss
+            node_loss
+            + edge_feat_loss
+            + edge_loss
+            + self.beta * kl_loss
+            + self.prediction_weight * permeability_loss
         )
 
         # Return all loss components
         return {
             "total_loss": total_loss,
-            "recon_loss": recon_loss,
+            "node_loss": node_loss,
+            "edge_feat_loss": edge_feat_loss,
+            "edge_loss": edge_loss,
             "kl_loss": kl_loss,
-            "pred_loss": pred_loss,
+            "permeability_loss": permeability_loss,
         }

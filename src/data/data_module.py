@@ -220,26 +220,9 @@ class MoleculeDataModule(pl.LightningDataModule):
         Returns:
             int: Number of global features
         """
-        # Create a temporary dataset to determine the global feature dimension
-        if not hasattr(self, "global_feature_dim"):
-            if self.dataset is None:
-                # Setup dataset if not already done
-                self.dataset = MoleculeDataset(
-                    csv_file=self.data_path,
-                    smiles_col=self.smiles_col,
-                    property_cols=self.property_cols,
-                    max_atoms=self.max_atoms,
-                    filter_pampa=self.filter_pampa,
-                    pampa_threshold=self.pampa_threshold,
-                )
-
-            # Get the first molecule to determine feature dimension
-            sample = self.dataset[0]
-            global_features = sample["global_features"]
-            self.global_feature_dim = global_features.shape[0]
-            print(f"Dynamic global feature dimension: {self.global_feature_dim}")
-
-        return self.global_feature_dim
+        # Use a fixed global feature dimension of 17
+        # This matches the dimension in the smiles_to_features module
+        return 17
 
     def get_num_properties(self):
         """

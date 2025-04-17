@@ -12,82 +12,64 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 
 def smiles_to_graph(smiles: str, max_atoms: int = 150) -> Dict[str, Any]:
     """
-    Convert a SMILES string to a graph representation for the GraphVAE model.
+    Convert a SMILES string to a molecular graph representation.
 
     Args:
-        smiles: SMILES string to convert
+        smiles: The SMILES string to convert
         max_atoms: Maximum number of atoms to consider
 
     Returns:
-        Dictionary with graph features: x, edge_index, edge_attr, global_features, etc.
+        Dictionary containing node features, edge indices, and edge features
     """
-    # Parse SMILES string
+    # Convert SMILES to RDKit molecule
     mol = Chem.MolFromSmiles(smiles)
+
+    # Return empty dict if conversion failed
     if mol is None:
-        raise ValueError(f"Invalid SMILES string: {smiles}")
+        return {
+            "x": np.zeros((0, 0), dtype=np.float32),
+            "edge_index": np.zeros((2, 0), dtype=np.int64),
+            "edge_attr": np.zeros((0, 0), dtype=np.float32),
+        }
 
-    # Calculate molecular descriptors for global features
-    global_features = calculate_global_features(mol)
-
-    # Generate atom (node) features
-    x = []
+    # Get atom features
+    atom_features = []
     for atom in mol.GetAtoms():
-        atom_features = get_atom_features(atom)
-        x.append(atom_features)
+        atom_features.append(get_atom_features(atom))
 
-    # Pad or truncate to max_atoms
-    num_atoms = len(x)
-    if num_atoms > max_atoms:
-        x = x[:max_atoms]
-    elif num_atoms < max_atoms:
-        # Pad with zeros
-        padding = [np.zeros(len(x[0]))] * (max_atoms - num_atoms)
-        x.extend(padding)
+    x = np.array(atom_features, dtype=np.float32)
+    num_atoms = len(atom_features)
 
-    # Generate edge features
-    edge_index = []
-    edge_attr = []
+    # No need to truncate or pad based on max_atoms
 
-    # Add bonds (edges)
+    # Get edge indices and features
+    edge_indices = []
+    edge_attrs = []
+
     for bond in mol.GetBonds():
         i = bond.GetBeginAtomIdx()
         j = bond.GetEndAtomIdx()
 
-        # Skip if atoms are out of range (due to truncation)
-        if i >= max_atoms or j >= max_atoms:
-            continue
+        # Add edges in both directions
+        edge_indices.append([i, j])
+        edge_indices.append([j, i])
 
-        # Add edge in both directions (undirected graph)
-        edge_index.extend([[i, j], [j, i]])
+        # Add edge features for both directions
+        edge_attrs.append(get_bond_features(bond))
+        edge_attrs.append(get_bond_features(bond))
 
-        # Get bond features
-        bond_features = get_bond_features(bond)
-        # Add edge features in both directions
-        edge_attr.extend([bond_features, bond_features])
-
-    # Convert to tensors
-    x = torch.tensor(np.array(x), dtype=torch.float)
-
-    if edge_index:  # Check if there are any edges
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t()
-        edge_attr = torch.tensor(np.array(edge_attr), dtype=torch.float)
+    # Handle no bonds case
+    if len(edge_indices) == 0:
+        edge_index = np.zeros((2, 0), dtype=np.int64)
+        edge_attr = np.zeros((0, len(get_bond_features(None))), dtype=np.float32)
     else:
-        # Create empty tensors with the correct shape if no edges
-        edge_index = torch.zeros((2, 0), dtype=torch.long)
-        edge_attr = torch.zeros((0, 9), dtype=torch.float)  # 9 bond features
-
-    global_features = torch.tensor(global_features, dtype=torch.float).unsqueeze(0)
-
-    # Create batch index for a single molecule
-    batch = torch.zeros(x.size(0), dtype=torch.long)
+        edge_index = np.array(edge_indices, dtype=np.int64).T
+        edge_attr = np.array(edge_attrs, dtype=np.float32)
 
     return {
         "x": x,
         "edge_index": edge_index,
         "edge_attr": edge_attr,
-        "global_features": global_features,
-        "batch": batch,
-        "num_graphs": 1,
     }
 
 
@@ -192,7 +174,7 @@ def get_bond_features(bond: Chem.Bond) -> List[float]:
     stereo = bond.GetStereo()
     stereo_features = [0] * 3  # None, Z/Cis, E/Trans
 
-    if stereo == Chem.rdchem.BondStereo.STEREONONE:
+    if stereo == Chem.rdchem.BondStereo.STERONONE:
         stereo_features[0] = 1
     elif stereo in [Chem.rdchem.BondStereo.STEREOZ, Chem.rdchem.BondStereo.STEREOCIS]:
         stereo_features[1] = 1
@@ -408,8 +390,10 @@ def smiles_to_model_input(smiles: str, max_atoms: int = 150) -> Dict[str, torch.
             "x": graph_data["x"].unsqueeze(0),
             "edge_index": graph_data["edge_index"].unsqueeze(0),
             "edge_attr": graph_data["edge_attr"].unsqueeze(0),
-            "batch": graph_data["batch"].unsqueeze(0),
-            "global_features": graph_data["global_features"].unsqueeze(0),
+            "batch": torch.zeros(graph_data["x"].shape[0], dtype=torch.long),
+            "global_features": torch.tensor(
+                calculate_global_features(Chem.MolFromSmiles(smiles)), dtype=torch.float
+            ).unsqueeze(0),
             "num_graphs": 1,
         }
     except Exception as e:

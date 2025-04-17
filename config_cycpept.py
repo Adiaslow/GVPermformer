@@ -14,11 +14,11 @@ config.project_name = "GraphVAE_CycPept"
 config.data = DataConfig()
 config.data.data_path = "training_data/CycPeptMPDB_Peptide_All.csv"
 config.data.smiles_col = "SMILES"
-config.data.property_cols = ["MolLogP", "PSA", "MolWt"]
-config.data.batch_size = 16
+config.data.property_cols = ["PAMPA"]  # Predicting PAMPA permeability
+config.data.batch_size = 32
 config.data.train_val_test_split = (0.8, 0.1, 0.1)
-config.data.max_atoms = 150  # Increased for larger peptides
-config.data.num_workers = 4
+config.data.max_atoms = 500  # Increased for larger peptides
+config.data.num_workers = 2
 config.data.random_seed = 42
 
 # Model configuration

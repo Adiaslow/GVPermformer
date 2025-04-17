@@ -5,25 +5,133 @@ Graph Variational Autoencoder model for molecular representation learning.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import (
-    GCNConv,
-    GATConv,
-    GINConv,
-    global_mean_pool,
-    SAGEConv,
-    GlobalAttention,
+import torch.utils.checkpoint
+from torch import Tensor
+from typing import (
+    Dict,
+    Any,
+    Optional,
+    List,
+    Tuple,
+    Union,
+    Callable,
+    TypeVar,
+    Protocol,
+    runtime_checkable,
+    Type,
 )
-import pytorch_lightning as pl
-from typing import Dict, List, Tuple, Optional, Union
+from typing_extensions import TypeGuard
+import torch.jit as jit
+
+try:
+    import pytorch_lightning as pl
+
+    LightningModule = pl.LightningModule
+except ImportError:
+    print("Warning: pytorch_lightning not found. Some functionality may be limited.")
+
+    class LightningModule:
+        def save_hyperparameters(self) -> None:
+            pass
+
+
+# Define type aliases and fallbacks for torch_geometric types
+try:
+    from torch_geometric.nn import (
+        GATConv,
+        GCNConv,
+        TransformerConv,
+        global_mean_pool,
+        MessagePassing,
+    )
+    from torch_geometric.data import Data as PyGData, Batch as PyGBatch
+
+    HAS_PYGEOMETRIC = True
+    Data = PyGData
+    Batch = PyGBatch
+except ImportError:
+    print("Warning: torch_geometric not found. Some functionality may be limited.")
+    HAS_PYGEOMETRIC = False
+
+    # Type aliases for type checking when torch_geometric is not available
+    @runtime_checkable
+    class Data(Protocol):
+        x: Tensor
+        edge_index: Tensor
+        edge_attr: Optional[Tensor]
+        batch: Optional[Tensor]
+        y: Optional[Tensor]
+
+    @runtime_checkable
+    class Batch(Data, Protocol):
+        pass
+
+    class BaseConv(nn.Module):
+        def forward(
+            self, x: Tensor, edge_index: Tensor, *args: Any, **kwargs: Any
+        ) -> Tensor:
+            raise NotImplementedError
+
+    GATConv = BaseConv
+    GCNConv = BaseConv
+    TransformerConv = BaseConv
+    MessagePassing = BaseConv
+
+    def global_mean_pool(
+        x: Tensor, batch: Optional[Tensor], *args: Any, **kwargs: Any
+    ) -> Tensor:
+        raise NotImplementedError
+
+
+T = TypeVar("T", bound=Tensor)
+DataT = TypeVar("DataT", bound=Union[Data, Batch])
+FixtureFunction = Callable[[T], T]
+
+
+# JIT-compiled operations
+@torch.jit.script
+def fused_gelu(x):
+    return x * 0.5 * (1.0 + torch.tanh(0.797884560802865 * x * (1 + 0.044715 * x * x)))
+
+
+@torch.jit.script
+def reparameterize(mu: Tensor, logvar: Tensor) -> Tensor:
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mu + eps * std
+
+
+@torch.jit.script
+def compute_vae_loss(
+    x: torch.Tensor,
+    recon_x: torch.Tensor,
+    z_mean: torch.Tensor,
+    z_logvar: torch.Tensor,
+    beta: float,
+    num_graphs: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    recon_loss = F.mse_loss(recon_x, x, reduction="sum") / num_graphs
+    kl_loss = (
+        -0.5 * torch.sum(1 + z_logvar - z_mean.pow(2) - z_logvar.exp()) / num_graphs
+    )
+    total_loss = recon_loss + beta * kl_loss
+    return total_loss, recon_loss, kl_loss
+
+
+@torch.jit.script
+def efficient_mse_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Efficient MSE loss computation"""
+    return F.mse_loss(x, y, reduction="mean")
+
+
+@torch.jit.script
+def efficient_kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """Efficient KL divergence computation"""
+    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
 
 class GraphEncoder(nn.Module):
-    """
-    Enhanced Graph encoder module with skip connections and mixed convolution types.
-
-    Uses a combination of GAT and GIN layers with residual connections for better
-    gradient flow and representation capacity.
-    """
+    """Optimized graph encoder using efficient GNN techniques."""
 
     def __init__(
         self,
@@ -31,150 +139,118 @@ class GraphEncoder(nn.Module):
         edge_features: int,
         hidden_dim: int = 256,
         latent_dim: int = 64,
-        num_layers: int = 3,
+        num_layers: int = 4,
         dropout: float = 0.1,
+        gnn_type: str = "gat",
     ):
-        """
-        Graph encoder for the VAE.
-
-        Args:
-            node_features: Number of node features
-            edge_features: Number of edge features
-            hidden_dim: Hidden dimension size
-            latent_dim: Latent space dimension size
-            num_layers: Number of graph convolution layers
-            dropout: Dropout rate
-        """
         super().__init__()
-        print(
-            f"Initializing GraphEncoder with node_features={node_features}, edge_features={edge_features}"
-        )
-
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.num_layers = num_layers
-        self.dropout = dropout
+        self.gnn_type = gnn_type
 
-        # Node embedding layer
-        self.node_embedding = nn.Linear(node_features, hidden_dim)
+        # Use 16-bit precision for linear layers to reduce memory usage
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_features, hidden_dim, dtype=torch.float16),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
 
-        # Edge embedding layer (if edge features exist)
-        self.has_edge_attr = edge_features > 0
-        if self.has_edge_attr:
-            self.edge_embedding = nn.Linear(edge_features, hidden_dim)
-
-        # Mixed convolution layers with skip connections
-        self.convs = nn.ModuleList()
-        self.batch_norms = nn.ModuleList()
-        self.dropouts = nn.ModuleList()
-
-        # Initialize with different convolution types
-        for i in range(num_layers):
-            input_dim = hidden_dim
-
-            # Alternate between different convolution types
-            if i % 3 == 0:  # GCN for every 3rd layer starting with 0
-                self.convs.append(GCNConv(input_dim, hidden_dim))
-            elif i % 3 == 1:  # GAT for every 3rd layer starting with 1
-                self.convs.append(
-                    GATConv(input_dim, hidden_dim // 8, heads=8, dropout=dropout)
-                )
-            else:  # GraphSAGE for every 3rd layer starting with 2
-                self.convs.append(SAGEConv(input_dim, hidden_dim))
-
-            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
-            self.dropouts.append(nn.Dropout(dropout))
-
-        # Improved global pooling with attention
-        self.pool = GlobalAttention(
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, 1),
+        if edge_features > 0:
+            self.edge_encoder = nn.Sequential(
+                nn.Linear(edge_features, hidden_dim, dtype=torch.float16),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
             )
-        )
+        else:
+            self.edge_encoder = None
 
-        # Projection to latent space parameters
-        self.mu_projection = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, latent_dim),
-        )
+        # Efficient GNN layers
+        self.convs = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
 
-        self.logvar_projection = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, latent_dim),
-        )
+        for _ in range(num_layers):
+            if gnn_type == "gat":
+                conv = GATConv(
+                    hidden_dim,
+                    hidden_dim // 4,
+                    heads=4,
+                    dropout=dropout,
+                    edge_dim=hidden_dim if edge_features > 0 else None,
+                    add_self_loops=True,
+                )
+            elif gnn_type == "transformer":
+                conv = TransformerConv(
+                    hidden_dim,
+                    hidden_dim // 4,
+                    heads=4,
+                    dropout=dropout,
+                    edge_dim=hidden_dim if edge_features > 0 else None,
+                )
+            else:  # GCN
+                conv = GCNConv(hidden_dim, hidden_dim)
+
+            self.convs.append(conv)
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
+
+        # Efficient global pooling
+        self.global_pool = global_mean_pool
+
+        # Latent projections
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim, dtype=torch.float16)
+        self.fc_var = nn.Linear(hidden_dim, latent_dim, dtype=torch.float16)
 
     def forward(self, x, edge_index, edge_attr=None, batch=None):
-        """
-        Forward pass through the encoder.
+        # Enable automatic mixed precision
+        with torch.cuda.amp.autocast():
+            # Initial node embedding
+            h = self.node_encoder(x)
 
-        Args:
-            x: Node features [num_nodes, node_features]
-            edge_index: Edge indices [2, num_edges]
-            edge_attr: Edge attributes [num_edges, edge_features]
-            batch: Batch indices [num_nodes]
+            # Process edge features if available
+            edge_features = None
+            if self.edge_encoder is not None and edge_attr is not None:
+                edge_features = self.edge_encoder(edge_attr)
 
-        Returns:
-            mu: Mean of the latent distribution
-            logvar: Log variance of the latent distribution
-        """
-        # Initial node embedding
-        h = self.node_embedding(x)
+            # Efficient message passing with gradient checkpointing
+            for i, (conv, norm) in enumerate(zip(self.convs, self.layer_norms)):
 
-        # Edge embedding if available
-        edge_features = None
-        if self.has_edge_attr and edge_attr is not None:
-            edge_features = self.edge_embedding(edge_attr)
+                def custom_forward(h_inner, edge_index_inner, edge_features_inner=None):
+                    if isinstance(conv, (GATConv, TransformerConv)):
+                        out = conv(h_inner, edge_index_inner, edge_features_inner)
+                    else:
+                        out = conv(h_inner, edge_index_inner)
+                    return out
 
-        # Apply graph convolutions with skip connections
-        for i in range(self.num_layers):
-            # Store previous representation for skip connection
-            h_prev = h
+                h_prev = h
+                if self.training:
+                    h = torch.utils.checkpoint.checkpoint(
+                        custom_forward, h, edge_index, edge_features
+                    )
+                else:
+                    h = custom_forward(h, edge_index, edge_features)
 
-            # Apply different convolution types
-            if isinstance(self.convs[i], GATConv) or isinstance(self.convs[i], GCNConv):
-                # GAT and GCN take only node features and edge indices
-                h = self.convs[i](h, edge_index)
-            elif isinstance(self.convs[i], SAGEConv):
-                # GraphSAGE takes node features and edge indices
-                h = self.convs[i](h, edge_index)
+                # Efficient normalization and residual
+                h = norm(h)
+                h = F.gelu(h)
+                if h_prev.shape == h.shape:
+                    h = h + h_prev
 
-            # Apply batch normalization and non-linearity
-            h = self.batch_norms[i](h)
-            h = F.relu(h)
+            # Efficient global pooling
+            h = self.global_pool(h, batch)
 
-            # Apply skip connection if dimensions match
-            if h_prev.shape == h.shape:
-                h = h_prev + h  # Skip connection
+            # Project to latent space
+            z_mean = self.fc_mu(h)
+            z_logvar = self.fc_var(h)
 
-            # Apply dropout
-            h = self.dropouts[i](h)
-
-        # Global pooling with attention to handle variable graph sizes
-        h_graph = self.pool(h, batch)
-
-        # Project to latent space parameters
-        mu = self.mu_projection(h_graph)
-        logvar = self.logvar_projection(h_graph)
-
-        return mu, logvar
+        return z_mean, z_logvar
 
 
 class GraphDecoder(nn.Module):
-    """
-    Graph decoder module for reconstructing graphs from latent representations.
-
-    Generates node features and edge probabilities from latent vectors.
-    """
+    """Optimized graph decoder with efficient reconstruction."""
 
     def __init__(
         self,
@@ -185,149 +261,274 @@ class GraphDecoder(nn.Module):
         max_nodes: int = 50,
         dropout: float = 0.1,
     ):
-        """
-        Initialize the graph decoder.
-
-        Args:
-            node_features: Number of node features to reconstruct
-            edge_features: Number of edge features to reconstruct
-            hidden_dim: Hidden dimension size
-            latent_dim: Latent space dimension size
-            max_nodes: Maximum number of nodes in graphs
-            dropout: Dropout rate
-        """
         super().__init__()
-
         self.node_features = node_features
         self.edge_features = edge_features
         self.max_nodes = max_nodes
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        # Latent to hidden
-        self.latent_to_hidden = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+        # Efficient latent processing
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim, dtype=torch.float16),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Node feature generation
+        self.node_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, dtype=torch.float16),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, node_features, dtype=torch.float16),
+        )
+
+        # Optional edge feature generation
+        if edge_features > 0:
+            self.edge_decoder = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim, dtype=torch.float16),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, edge_features, dtype=torch.float16),
+            )
+        else:
+            self.edge_decoder = None
+
+    def forward(
+        self, z: torch.Tensor, batch: Optional[Data] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        with torch.cuda.amp.autocast():
+            # Project latent to hidden
+            h = self.latent_proj(z)
+
+            # Use precomputed structures from batch if available
+            if batch is not None and hasattr(batch, "x"):
+                num_nodes = batch.x.size(0)
+                edge_index = batch.edge_index
+                h_expanded = h[batch.batch]
+            else:
+                num_nodes = self.max_nodes * z.size(0)
+                h_expanded = h.repeat_interleave(self.max_nodes, dim=0)
+                edge_index = torch.arange(num_nodes, device=z.device)
+                edge_index = torch.stack([edge_index, edge_index], dim=0)
+
+            # Generate node features
+            if self.training:
+
+                def custom_forward(h_inner):
+                    return self.node_decoder(h_inner)
+
+                node_features = torch.utils.checkpoint.checkpoint(
+                    custom_forward, h_expanded
+                )
+            else:
+                node_features = self.node_decoder(h_expanded)
+
+            # Generate edge features if needed
+            edge_features = None
+            if self.edge_decoder is not None and edge_index is not None:
+                src, dst = edge_index
+                edge_h = torch.cat([h_expanded[src], h_expanded[dst]], dim=-1)
+
+                if self.training:
+
+                    def custom_edge_forward(edge_h_inner):
+                        return self.edge_decoder(edge_h_inner)
+
+                    edge_features = torch.utils.checkpoint.checkpoint(
+                        custom_edge_forward, edge_h
+                    )
+                else:
+                    edge_features = self.edge_decoder(edge_h)
+
+        return node_features, edge_index, edge_features
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with layer normalization and GELU activation."""
+
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
         )
 
-        # Node feature production - simpler to avoid shape issues
-        self.node_out = nn.Linear(hidden_dim, node_features)
+    def forward(self, x):
+        return x + self.layers(x)
 
-        # Edge feature production
-        self.edge_out = nn.Linear(hidden_dim, edge_features)
 
-    def forward(self, z, batch_size=None):
-        """
-        Forward pass through the decoder.
+class EdgeAttention(nn.Module):
+    """Edge attention module for improved edge feature generation."""
 
-        Args:
-            z: Latent vectors [batch_size, latent_dim]
-            batch_size: Batch size (unused, kept for compatibility)
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
 
-        Returns:
-            tuple: (node_features, edge_features)
-        """
-        # Get hidden representation from latent
-        h = self.latent_to_hidden(z)  # [batch_size, hidden_dim]
+    def forward(self, node_h, edge_index):
+        # Get node pairs for edges
+        src, dst = edge_index
+        src_h = node_h[src]
+        dst_h = node_h[dst]
 
-        # Output node features directly - simpler approach
-        node_features = self.node_out(h)  # [batch_size, node_features]
+        # Compute attention scores
+        edge_input = torch.cat([src_h, dst_h], dim=-1)
+        attention = torch.sigmoid(self.attention(edge_input))
 
-        # Output edge features
-        edge_features = self.edge_out(h)  # [batch_size, edge_features]
-
-        return node_features, edge_features
+        # Weight the edge features
+        edge_h = torch.cat([src_h * attention, dst_h * attention], dim=-1)
+        return edge_h
 
 
 class PropertyPredictor(nn.Module):
     """
-    Enhanced module for predicting molecular properties from latent representations.
-    Uses a deeper architecture with residual connections and batch normalization.
+    Enhanced property predictor using modern deep learning techniques.
+    Uses ensemble of experts and uncertainty estimation.
     """
 
-    def __init__(self, latent_dim: int, hidden_dim: int, num_properties: int):
-        """
-        Initialize the enhanced property predictor.
-
-        Args:
-            latent_dim: Latent space dimension size
-            hidden_dim: Hidden dimension size
-            num_properties: Number of properties to predict
-        """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int = 256,
+        num_tasks: int = 1,
+        dropout: float = 0.1,
+        num_experts: int = 3,
+    ):
         super().__init__()
 
-        # Deeper network with residual connections and batch normalization
-        self.input_bn = nn.BatchNorm1d(latent_dim)
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.num_tasks = num_tasks
+        self.num_experts = num_experts
 
-        # First block
-        self.block1 = nn.Sequential(
+        # Expert networks
+        self.experts = nn.ModuleList(
+            [ExpertNetwork(latent_dim, hidden_dim, dropout) for _ in range(num_experts)]
+        )
+
+        # Gating network
+        self.gate = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),  # SiLU (Swish) activation for better performance
-            nn.Dropout(0.3),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_experts),
+            nn.Softmax(dim=-1),
         )
 
-        # Second block with residual connection
-        self.block2 = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(0.3),
-        )
-
-        # Residual connection
-        self.res_connection = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),
-        )
-
-        # Third block for final prediction
-        self.final = nn.Sequential(
+        # Uncertainty estimation
+        self.aleatoric_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
-            nn.SiLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim // 2, num_properties),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_tasks),
+            nn.Softplus(),
         )
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass through the property predictor.
-
-        Args:
-            z: Latent vectors
-
-        Returns:
-            Property predictions
+        Forward pass with uncertainty estimation.
+        Returns mean predictions and uncertainties.
         """
-        # Input normalization
-        x = self.input_bn(z)
+        # Get expert weights from gating network
+        expert_weights = self.gate(z)  # [batch_size, num_experts]
 
-        # First block
-        x = self.block1(x)
+        # Get predictions from each expert
+        expert_preds = []
+        expert_features = []
+        for expert in self.experts:
+            pred, features = expert(z)
+            expert_preds.append(pred)
+            expert_features.append(features)
 
-        # Second block with residual connection
-        identity = x
-        x = self.block2(x)
-        x = self.res_connection(x)
-        x = x + identity  # Residual connection
+        # Stack predictions and features
+        expert_preds = torch.stack(
+            expert_preds, dim=1
+        )  # [batch_size, num_experts, num_tasks]
+        expert_features = torch.stack(
+            expert_features, dim=1
+        )  # [batch_size, num_experts, hidden_dim]
 
-        # Final prediction
-        return self.final(x)
+        # Weighted average of predictions
+        weighted_preds = torch.sum(expert_preds * expert_weights.unsqueeze(-1), dim=1)
+
+        # Weighted average of features for uncertainty
+        weighted_features = torch.sum(
+            expert_features * expert_weights.unsqueeze(-1), dim=1
+        )
+
+        # Estimate aleatoric uncertainty
+        aleatoric_uncertainty = self.aleatoric_head(weighted_features)
+
+        # Estimate epistemic uncertainty from expert disagreement
+        mean_pred = expert_preds.mean(dim=1)
+        epistemic_uncertainty = torch.var(expert_preds, dim=1)
+
+        # Combine uncertainties
+        total_uncertainty = aleatoric_uncertainty + epistemic_uncertainty
+
+        return weighted_preds, total_uncertainty
+
+
+class ExpertNetwork(nn.Module):
+    """Individual expert network with residual connections."""
+
+    def __init__(self, latent_dim: int, hidden_dim: int, dropout: float):
+        super().__init__()
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Residual blocks
+        self.residual_blocks = nn.ModuleList(
+            [ResidualBlock(hidden_dim, dropout) for _ in range(2)]
+        )
+
+        # Output head
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Initial projection
+        h = self.input_proj(z)
+
+        # Apply residual blocks
+        for block in self.residual_blocks:
+            h = block(h)
+
+        # Get prediction
+        pred = self.output_head(h)
+
+        return pred, h
 
 
 class GlobalFeatureProcessor(nn.Module):
     """
-    Module for processing global molecular features.
-
-    Transforms raw global features into a representation suitable
-    for combining with graph representations.
+    MLP to process global molecular features before combining with graph encoding.
+    Uses LayerNorm instead of BatchNorm to avoid issues with small batch sizes.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
@@ -335,665 +536,483 @@ class GlobalFeatureProcessor(nn.Module):
         Initialize the global feature processor.
 
         Args:
-            input_dim: Number of input global features
-            hidden_dim: Hidden dimension size
-            output_dim: Output dimension size
+            input_dim: Input dimension (number of global features)
+            hidden_dim: Hidden dimension
+            output_dim: Output dimension (should match latent space dimension)
         """
         super().__init__()
-
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # Using LayerNorm instead of BatchNorm
             nn.ReLU(),
-            nn.BatchNorm1d(hidden_dim),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim),  # Using LayerNorm instead of BatchNorm
             nn.ReLU(),
-            nn.BatchNorm1d(output_dim),
         )
 
     def forward(self, x):
-        """
-        Forward pass through the global feature processor.
-
-        Args:
-            x: Global feature tensor [batch_size, input_dim]
-
-        Returns:
-            Processed global features [batch_size, output_dim]
-        """
+        """Forward pass through the MLP."""
         return self.mlp(x)
 
 
-class GraphVAE(pl.LightningModule):
-    """
-    Graph Variational Autoencoder for molecular representation learning.
+def is_geometric_data(obj: Any) -> TypeGuard[Union[Data, Batch]]:
+    return isinstance(obj, (Data, Batch))
 
-    Combines graph encoder, decoder, and optional property prediction
-    in a variational framework.
+
+class OptimizedGraphVAE(LightningModule):
+    """
+    Graph Variational Autoencoder with optimized MPS/GPU performance
     """
 
     def __init__(
         self,
         node_features: int,
         edge_features: int,
-        hidden_dim: int = 256,
+        hidden_dim: int = 128,
         latent_dim: int = 64,
-        property_prediction: bool = True,
-        num_properties: int = 1,
-        beta: float = 0.5,
-        weight_decay: float = 1e-5,
-        learning_rate: float = 3e-4,
-        max_nodes: int = 50,
-        global_features: int = 0,
-        num_layers: int = 3,
-        dropout: float = 0.1,
-        use_huber_loss: bool = True,
-        use_feature_attention: bool = True,
-        batch_size: int = 32,
-    ):
+        max_nodes: int = 100,
+        dropout: float = 0.2,
+        use_edge_features: bool = True,
+        use_enhanced_features: bool = False,
+        property_prediction: bool = False,
+        learning_rate: float = 1e-3,
+        beta: float = 0.1,  # KL weight parameter
+        gnn_type: str = "gcn",  # Type of GNN to use
+    ) -> None:
         """
-        Graph Variational Autoencoder with property prediction capability.
+        Initializes the Graph Variational Autoencoder with optimized performance.
 
         Args:
-            node_features: Number of node features
-            edge_features: Number of edge features
+            node_features: Dimension of node features
+            edge_features: Dimension of edge features
             hidden_dim: Hidden dimension size
-            latent_dim: Latent space dimension size
-            property_prediction: Whether to predict properties
-            num_properties: Number of properties to predict
-            beta: Weight for KL divergence loss (was kl_weight)
-            weight_decay: Weight decay for optimizer
-            learning_rate: Learning rate for optimizer
-            max_nodes: Maximum number of nodes in graphs
-            global_features: Number of global features
-            num_layers: Number of graph convolution layers
+            latent_dim: Latent dimension size
+            max_nodes: Maximum number of nodes in a graph
             dropout: Dropout rate
-            use_huber_loss: Whether to use Huber loss instead of MSE for property prediction
-            use_feature_attention: Whether to use feature-wise attention
-            batch_size: Default batch size for logging metrics
+            use_edge_features: Whether to use edge features
+            use_enhanced_features: Whether enhanced atom features are used
+            property_prediction: Whether to include property prediction
+            learning_rate: Learning rate for optimization
+            beta: Weight for KL divergence loss
+            gnn_type: Type of GNN to use (gcn, gat, or transformer)
         """
         super().__init__()
+        if not HAS_PYGEOMETRIC:
+            raise ImportError("torch_geometric is required for GraphVAE")
         self.save_hyperparameters()
 
-        # Store parameters
+        # Set device-specific attributes
+        self.use_mps = torch.backends.mps.is_available()
+        self.use_cuda = torch.cuda.is_available()
+
+        self.learning_rate = learning_rate
+        self.beta = beta
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
-        self.property_prediction = property_prediction
-        self.num_properties = num_properties
-        self.beta = beta
-        self.weight_decay = weight_decay
-        self.learning_rate = learning_rate
         self.max_nodes = max_nodes
-        self.global_features = global_features
-        self.use_huber_loss = use_huber_loss
-        self.use_feature_attention = use_feature_attention
-        self.batch_size = batch_size
+        self.dropout_rate = dropout
+        self.use_edge_features = use_edge_features
+        self.use_enhanced_features = use_enhanced_features
+        self.property_prediction = property_prediction
+        self.gnn_type = gnn_type
 
-        # Encoder
+        # Enable automatic mixed precision
+        self.automatic_optimization = False
+
+        # Initialize model components
         self.encoder = GraphEncoder(
             node_features=node_features,
-            edge_features=edge_features,
+            edge_features=edge_features if use_edge_features else 0,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
-            num_layers=num_layers,
             dropout=dropout,
+            gnn_type=gnn_type,
         )
 
-        # Decoder
         self.decoder = GraphDecoder(
             node_features=node_features,
-            edge_features=edge_features,
+            edge_features=edge_features if use_edge_features else 0,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             max_nodes=max_nodes,
             dropout=dropout,
         )
 
-        # Feature-wise attention for enhancing important features
-        if self.use_feature_attention:
-            self.feature_attention = nn.Sequential(
-                nn.Linear(latent_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, latent_dim),
-                nn.Sigmoid(),
+        if property_prediction:
+            self.property_predictor = PropertyPredictor(
+                latent_dim=latent_dim,
+                hidden_dim=hidden_dim,
+                num_tasks=1,
+                dropout=dropout,
+                num_experts=3,
             )
-
-        # Property predictor
-        if self.property_prediction and self.num_properties > 0:
-            self.property_predictor = nn.Sequential(
-                nn.Linear(latent_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, num_properties),
-            )
-
-        # Global feature processor if needed
-        if self.global_features > 0:
-            self.global_processor = GlobalFeatureProcessor(
-                input_dim=self.global_features,
-                hidden_dim=hidden_dim // 2,
-                output_dim=latent_dim,
-            )
-
-        # Cache for steps_per_epoch
-        self._steps_per_epoch = None
-
-        # Initialize caching flag for MPS
-        self.mps_warmup_done = False
-
-        # Initialize metrics
-        self.best_val_loss = float("inf")
-
-        print(
-            f"Initialized GraphVAE with {sum(p.numel() for p in self.parameters() if p.requires_grad):,} parameters"
-        )
-        print(f"Node features: {node_features}, Edge features: {edge_features}")
-        print(
-            f"Latent dimension: {latent_dim}, Property prediction: {property_prediction}"
-        )
-
-    def apply_feature_attention(self, z):
-        """Apply feature-wise attention to enhance important features."""
-        if not self.use_feature_attention:
-            return z
-
-        attention_weights = self.feature_attention(z)
-        return z * attention_weights
-
-    def encode(self, x, edge_index, edge_attr, batch):
-        """Encode input graph to latent representation."""
-        # Do MPS warmup if needed
-        if torch.backends.mps.is_available() and not self.mps_warmup_done:
-            self._warmup_mps()
-
-        # Encode to latent space
-        mu, logvar = self.encoder(x, edge_index, edge_attr, batch)
-
-        # Apply feature-wise attention to enhance important dimensions
-        mu = self.apply_feature_attention(mu)
-
-        return mu, logvar
-
-    def decode(self, z, batch_size):
-        """Decode latent representation to output graph."""
-        return self.decoder(z, batch_size)
-
-    def reparameterize(self, mu, logvar):
-        """Reparameterization trick to sample from latent distribution."""
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
         else:
-            return mu
+            self.property_predictor = None
 
-    def forward(self, batch):
-        """Forward pass through the model."""
-        # Handle both dictionary and Data object formats
-        if isinstance(batch, dict):
-            # Extract data from dictionary
-            x = batch["x"]
-            edge_index = batch["edge_index"]
-            edge_attr = batch.get("edge_attr", None)
-            batch_idx = batch.get("batch", None)
-            num_graphs = batch.get("num_graphs", 1)
-            global_features = batch.get("global_features", None)
-        else:
-            # Extract data from PyG Data object
-            x, edge_index, edge_attr, batch_idx = (
-                batch.x,
-                batch.edge_index,
-                batch.edge_attr,
-                batch.batch,
+    def _move_to_device(self, data, device):
+        """Move data to the specified device with proper error handling"""
+        try:
+            if hasattr(data, "to"):
+                return data.to(device)
+            elif isinstance(data, dict):
+                return {
+                    key: (value.to(device) if hasattr(value, "to") else value)
+                    for key, value in data.items()
+                }
+            return data
+        except Exception as e:
+            print(f"Error moving data to device {device}: {str(e)}")
+            raise
+
+    def forward(self, data: DataT) -> Dict[str, Union[Tensor, Optional[Tensor]]]:
+        """Forward pass of the VAE model."""
+        if not is_geometric_data(data):
+            raise TypeError("Input must be a PyTorch Geometric Data or Batch object")
+        try:
+            # Move data to the correct device
+            device = self.device
+            data = self._move_to_device(data, device)
+
+            # Encode input to latent representation
+            z_mean, z_logvar = self.encode(data)
+
+            # Sample from the latent distribution
+            z = reparameterize(z_mean, z_logvar)
+
+            # Decode latent representation
+            node_features, edge_index, edge_features = self.decode(z, data)
+
+            # Property prediction if enabled
+            prop_pred = None
+            if self.property_prediction and self.property_predictor is not None:
+                prop_pred, _ = self.property_predictor(z_mean)
+
+            return {
+                "z_mean": z_mean,
+                "z_logvar": z_logvar,
+                "z": z,
+                "node_features": node_features,
+                "edge_index": edge_index,
+                "edge_features": edge_features if self.use_edge_features else None,
+                "prop_pred": prop_pred,
+            }
+        except Exception as e:
+            print(f"Error in forward pass: {str(e)}")
+            raise
+
+    def _prepare_batch(self, data):
+        """
+        Extract and validate features from input data.
+
+        Args:
+            data: Input data (PyG Data object or dictionary)
+
+        Returns:
+            Tuple of (x, edge_index, edge_attr, batch)
+        """
+        try:
+            # Extract features
+            x = data.x if hasattr(data, "x") else data.get("x")
+            edge_index = (
+                data.edge_index
+                if hasattr(data, "edge_index")
+                else data.get("edge_index")
             )
-            num_graphs = batch.num_graphs
-            global_features = getattr(batch, "global_features", None)
-
-        # Encode
-        mu, logvar = self.encode(x, edge_index, edge_attr, batch_idx)
-
-        # Sample latent vector
-        z = self.reparameterize(mu, logvar)
-
-        # Process global features if available
-        if self.global_features > 0 and global_features is not None:
-            global_z = self.global_processor(global_features)
-            # Concatenate or combine with z
-            z = z + global_z  # Simple addition, could be more sophisticated
-
-        # Decode
-        node_pred, edge_pred = self.decode(z, num_graphs)
-
-        # Predict properties if required
-        prop_pred = None
-        if self.property_prediction:
-            if isinstance(batch, dict) and "y" in batch:
-                prop_pred = self.property_predictor(z)
-            elif hasattr(batch, "y"):
-                prop_pred = self.property_predictor(z)
-
-        return {
-            "mu": mu,
-            "logvar": logvar,
-            "z": z,
-            "node_pred": node_pred,
-            "edge_pred": edge_pred,
-            "prop_pred": prop_pred,
-        }
-
-    def compute_loss(self, batch, outputs):
-        """Compute the loss for training and validation."""
-        # Unpack outputs
-        mu = outputs["mu"]
-        logvar = outputs["logvar"]
-        node_pred = outputs["node_pred"]
-        edge_pred = outputs["edge_pred"]
-        prop_pred = outputs["prop_pred"]
-
-        # Extract batch inputs based on type
-        if isinstance(batch, dict):
-            # Dictionary batch
-            x = batch.get("x", None)
-            edge_attr = batch.get("edge_attr", None)
-            y = batch.get("y", None)
-            batch_size = batch.get("batch_size", 1)
-        else:
-            # PyG Data object
-            x = getattr(batch, "x", None)
-            edge_attr = getattr(batch, "edge_attr", None)
-            y = getattr(batch, "y", None)
-            batch_size = getattr(batch, "num_graphs", 1)
-
-        # KL divergence - consistent across all models
-        kl_loss = -0.5 * torch.mean(
-            torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-        )
-
-        # Simplified loss computation - use mean value for reconstruction
-        # This avoids shape issues with varying batch sizes and dimensions
-        node_recon_loss = torch.tensor(0.0, device=mu.device)
-        edge_recon_loss = torch.tensor(0.0, device=mu.device)
-
-        # For reconstruction loss, we'll use a simple approach:
-        # Instead of trying to reconstruct each node/edge exactly,
-        # we'll compare the mean values, which is a simpler metric
-        # but still gives a signal about how well the autoencoder works
-        if x is not None:
-            # Get mean node features for comparison
-            mean_x = torch.mean(x, dim=0, keepdim=True)  # [1, node_features]
-
-            # Compute loss based on mean predictions
-            node_recon_loss = F.mse_loss(
-                torch.mean(node_pred, dim=0, keepdim=True), mean_x
+            edge_attr = (
+                data.edge_attr if hasattr(data, "edge_attr") else data.get("edge_attr")
             )
+            batch = data.batch if hasattr(data, "batch") else data.get("batch")
 
-        if edge_attr is not None and self.edge_features > 0:
-            # Get mean edge features for comparison
-            mean_edge_attr = torch.mean(
-                edge_attr, dim=0, keepdim=True
-            )  # [1, edge_features]
+            # Validate inputs
+            if x is None:
+                raise ValueError("Node features (x) are required but missing")
+            if edge_index is None:
+                raise ValueError("Edge indices are required but missing")
 
-            # Compute loss based on mean predictions
-            edge_recon_loss = F.mse_loss(
-                torch.mean(edge_pred, dim=0, keepdim=True), mean_edge_attr
-            )
+            # Ensure edge_index is correctly formatted
+            if edge_index.dim() == 2 and edge_index.size(0) != 2:
+                edge_index = edge_index.t()
 
-        # Reconstruction loss
-        recon_loss = node_recon_loss + edge_recon_loss
+            # Create batch index if not provided
+            if batch is None:
+                batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
-        # Property prediction loss
-        prop_loss = torch.tensor(0.0, device=mu.device)
-        if self.property_prediction and y is not None and prop_pred is not None:
-            # Ensure correct shapes for property prediction
-            if len(y.shape) == 1 and len(prop_pred.shape) == 2:
-                # Reshape target to match prediction format
-                y_reshaped = y.view(-1, 1)
+            # Ensure edge attributes match the model's configuration
+            if self.use_edge_features and edge_attr is None:
+                raise ValueError("Edge features are enabled but missing in input data")
+            elif not self.use_edge_features:
+                edge_attr = None
 
-                # Limit to min size if needed
-                min_size = min(prop_pred.shape[0], y_reshaped.shape[0])
-                prop_pred_used = prop_pred[:min_size]
-                y_used = y_reshaped[:min_size]
+            return x, edge_index, edge_attr, batch
 
-                if self.use_huber_loss:
-                    prop_loss = F.huber_loss(prop_pred_used, y_used, delta=1.0)
+        except Exception as e:
+            print(f"Error preparing batch: {str(e)}")
+            raise
+
+    def encode(self, data: Tensor) -> Tuple[Tensor, Tensor]:
+        """Encode input data to latent space."""
+        # Extract features from input data
+        x, edge_index, edge_attr, batch = self._prepare_batch(data)
+
+        # Pass through the encoder
+        z_mean, z_logvar = self.encoder(x, edge_index, edge_attr, batch)
+
+        return z_mean, z_logvar
+
+    def decode(
+        self, z: Tensor, batch: Optional[Data] = None
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+        """Decode latent representation."""
+        # Decode the latent representation
+        node_features, edge_index, edge_features = self.decoder(z, batch)
+
+        # If edge_index is None, create it
+        if edge_index is None:
+            # Store original batch size for later use in loss computation
+            self._last_batch_size = z.size(0)
+
+            # Create efficient edge index - self loops for compatibility
+            batch_size = z.size(0)
+            device = z.device
+
+            # MPS optimization: more efficient edge index creation
+            if self.use_mps:
+                # Optimize edge index creation for MPS
+                # Create a simple edge index with self-loops for each node
+                # This is a placeholder that will be properly constructed by downstream tasks
+                num_nodes = node_features.size(0) // batch_size
+
+                # Efficient edge index creation
+                node_indices = torch.arange(num_nodes, device=device)
+                edge_index = torch.stack([node_indices, node_indices], dim=0)
+
+                # Repeat for each batch
+                edge_indices = []
+                for i in range(batch_size):
+                    offset = i * num_nodes
+                    batch_edge_index = edge_index.clone()
+                    batch_edge_index += offset
+                    edge_indices.append(batch_edge_index)
+
+                if edge_indices:
+                    edge_index = torch.cat(edge_indices, dim=1)
                 else:
-                    prop_loss = F.mse_loss(prop_pred_used, y_used)
+                    edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             else:
-                # Try direct comparison if shapes compatible
-                try:
-                    if self.use_huber_loss:
-                        prop_loss = F.huber_loss(prop_pred, y, delta=1.0)
-                    else:
-                        prop_loss = F.mse_loss(prop_pred, y)
-                except Exception as e:
-                    print(f"Property loss calculation failed: {e}")
-                    print(f"Prop pred shape: {prop_pred.shape}, Y shape: {y.shape}")
+                # Standard implementation for other devices
+                num_nodes = (
+                    node_features.size(0) // batch_size
+                    if batch_size > 0
+                    else node_features.size(0)
+                )
 
-        # Total loss - weighted sum
+                # Create self-loops for compatibility
+                indices = torch.arange(num_nodes, device=device)
+                edge_index = torch.stack([indices, indices], dim=0)
+
+                # Repeat for each batch element
+                if batch_size > 1:
+                    repeated_indices = []
+                    for i in range(batch_size):
+                        offset = i * num_nodes
+                        batch_indices = edge_index.clone() + offset
+                        repeated_indices.append(batch_indices)
+                    edge_index = torch.cat(repeated_indices, dim=1)
+
+        return node_features, edge_index, edge_features
+
+    def compute_loss(
+        self,
+        batch: Union[Data, Batch],
+        reconstructed: Tuple[Tensor, Optional[Tensor], Optional[Tensor]],
+        z_mean: Tensor,
+        z_logvar: Tensor,
+    ) -> Dict[str, Tensor]:
+        """Compute VAE loss components."""
+        # Compute reconstruction loss for node features
+        # Ensure we only use the actual number of nodes from the input
+        recon_loss = efficient_mse_loss(reconstructed[0][: batch.x.size(0)], batch.x)
+
+        # Compute KL divergence loss
+        kl_loss = efficient_kl_loss(z_mean, z_logvar)
+
+        # Total loss
         total_loss = recon_loss + self.beta * kl_loss
 
-        if prop_loss > 0:
-            total_loss = total_loss + prop_loss
+        return {"loss": total_loss, "recon_loss": recon_loss, "kl_loss": kl_loss}
 
-        return {
-            "loss": total_loss,
-            "recon_loss": recon_loss,
-            "kl_loss": kl_loss,
-            "prop_loss": prop_loss,
-            "node_loss": node_recon_loss,
-            "edge_loss": edge_recon_loss,
-        }
+    def training_step(self, batch: Batch, batch_idx: int):
+        opt = self.optimizers()
 
-    def training_step(self, batch, batch_idx):
-        """Training step."""
+        # Enable automatic mixed precision
+        with torch.cuda.amp.autocast():
+            # Forward pass
+            z_mean, z_logvar = self.encode(batch)
+            z = reparameterize(z_mean, z_logvar)
+            reconstructed = self.decode(z, batch)
+
+            # Compute losses efficiently
+            loss_dict = self.compute_loss(batch, reconstructed, z_mean, z_logvar)
+
+            # Total loss
+            loss = loss_dict["loss"]
+
+        # Backward pass with gradient scaling
+        self.manual_backward(loss)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+        opt.step()
+        opt.zero_grad()
+
+        # Log metrics
+        self.log_dict(loss_dict, prog_bar=True)
+
+        return loss
+
+    def validation_step(self, batch: Union[Data, Batch], batch_idx: int) -> Tensor:
+        """
+        Validation step for Lightning.
+
+        Args:
+            batch: Input batch
+            batch_idx: Index of the batch
+
+        Returns:
+            Loss tensor
+        """
         # Forward pass
-        outputs = self(batch)
+        outputs = self.forward(batch)
 
         # Compute loss
-        loss_dict = self.compute_loss(batch, outputs)
-        total_loss = loss_dict["loss"]
-
-        # Determine batch size for logging
-        if isinstance(batch, dict):
-            batch_size = batch.get("num_graphs", self.batch_size)
-        else:
-            batch_size = getattr(batch, "num_graphs", self.batch_size)
-
-        # Get current learning rate from optimizer
-        current_lr = self.optimizers().param_groups[0]["lr"]
-
-        # Log metrics with explicit batch_size and on progress bar
-        self.log("train_loss", total_loss, prog_bar=True, batch_size=batch_size)
-        self.log("recon", loss_dict["recon_loss"], prog_bar=True, batch_size=batch_size)
-        self.log("kl", loss_dict["kl_loss"], prog_bar=True, batch_size=batch_size)
-        self.log("lr", current_lr, prog_bar=True, batch_size=batch_size)
-
-        # Full set of metrics
-        self.log("train_recon_loss", loss_dict["recon_loss"], batch_size=batch_size)
-        self.log("train_kl_loss", loss_dict["kl_loss"], batch_size=batch_size)
-        self.log("train_node_loss", loss_dict["node_loss"], batch_size=batch_size)
-        self.log("train_edge_loss", loss_dict["edge_loss"], batch_size=batch_size)
-
-        # Log property prediction loss if property prediction is enabled
-        if self.property_prediction and outputs["prop_pred"] is not None:
-            self.log(
-                "prop", loss_dict["prop_loss"], prog_bar=True, batch_size=batch_size
-            )
-            self.log("train_prop_loss", loss_dict["prop_loss"], batch_size=batch_size)
-
-            # Calculate and log property prediction metrics
-            if isinstance(batch, dict) and "y" in batch:
-                target = batch["y"]
-                pred = outputs["prop_pred"]
-                if target is not None and pred is not None:
-                    # Calculate metrics: MSE, MAE
-                    mse = F.mse_loss(pred, target).item()
-                    mae = F.l1_loss(pred, target).item()
-                    self.log("train_prop_mse", mse, batch_size=batch_size)
-                    self.log("train_prop_mae", mae, batch_size=batch_size)
-            elif hasattr(batch, "y") and batch.y is not None:
-                mse = F.mse_loss(outputs["prop_pred"], batch.y).item()
-                mae = F.l1_loss(outputs["prop_pred"], batch.y).item()
-                self.log("train_prop_mse", mse, batch_size=batch_size)
-                self.log("train_prop_mae", mae, batch_size=batch_size)
-
-        return total_loss
-
-    def validation_step(self, batch, batch_idx):
-        """Validation step."""
-        # Forward pass
-        outputs = self(batch)
-
-        # Compute loss
-        loss_dict = self.compute_loss(batch, outputs)
-        total_loss = loss_dict["loss"]
-
-        # Determine batch size for logging
-        if isinstance(batch, dict):
-            batch_size = batch.get("num_graphs", self.batch_size)
-        else:
-            batch_size = getattr(batch, "num_graphs", self.batch_size)
-
-        # Log metrics with explicit batch_size and on progress bar
-        self.log("val_loss", total_loss, prog_bar=True, batch_size=batch_size)
-        self.log(
-            "val_recon", loss_dict["recon_loss"], prog_bar=True, batch_size=batch_size
+        loss_dict = self.compute_loss(
+            batch,
+            (outputs["node_features"], outputs["edge_index"], outputs["edge_features"]),
+            outputs["z_mean"],
+            outputs["z_logvar"],
         )
-        self.log("val_kl", loss_dict["kl_loss"], prog_bar=True, batch_size=batch_size)
 
-        # Full set of metrics
-        self.log("val_recon_loss", loss_dict["recon_loss"], batch_size=batch_size)
-        self.log("val_kl_loss", loss_dict["kl_loss"], batch_size=batch_size)
-        self.log("val_node_loss", loss_dict["node_loss"], batch_size=batch_size)
-        self.log("val_edge_loss", loss_dict["edge_loss"], batch_size=batch_size)
+        # Log losses with explicit batch size
+        batch_size = batch.num_graphs
+        self.log(
+            "val_loss",
+            loss_dict["loss"],
+            batch_size=batch_size,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val_recon_loss",
+            loss_dict["recon_loss"],
+            batch_size=batch_size,
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_kl_loss",
+            loss_dict["kl_loss"],
+            batch_size=batch_size,
+            on_step=False,
+            on_epoch=True,
+        )
 
-        # Log property prediction metrics if property prediction is enabled
-        if self.property_prediction and outputs["prop_pred"] is not None:
-            self.log(
-                "val_prop", loss_dict["prop_loss"], prog_bar=True, batch_size=batch_size
-            )
-            self.log("val_prop_loss", loss_dict["prop_loss"], batch_size=batch_size)
+        return loss_dict["loss"]
 
-            # Calculate and log property prediction metrics
-            if isinstance(batch, dict) and "y" in batch:
-                target = batch["y"]
-                pred = outputs["prop_pred"]
-                if target is not None and pred is not None:
-                    # Calculate metrics: MSE, MAE
-                    mse = F.mse_loss(pred, target).item()
-                    mae = F.l1_loss(pred, target).item()
-                    self.log("val_prop_mse", mse, batch_size=batch_size)
-                    self.log("val_prop_mae", mae, batch_size=batch_size)
-            elif hasattr(batch, "y") and batch.y is not None:
-                mse = F.mse_loss(outputs["prop_pred"], batch.y).item()
-                mae = F.l1_loss(outputs["prop_pred"], batch.y).item()
-                self.log("val_prop_mse", mse, batch_size=batch_size)
-                self.log("val_prop_mae", mae, batch_size=batch_size)
-
-        # Track best validation loss for model selection
-        if total_loss < self.best_val_loss:
-            self.best_val_loss = total_loss
-            self.log("best_val_loss", self.best_val_loss, batch_size=batch_size)
-
-        return total_loss
-
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        """Prediction step."""
-        outputs = self(batch)
-        return outputs
-
-    def predict_from_smiles(self, smiles: str) -> Dict[str, torch.Tensor]:
+    def test_step(self, batch: Union[Data, Batch], batch_idx: int) -> Tensor:
         """
-        Predict properties directly from a SMILES string.
+        Test step for Lightning.
 
         Args:
-            smiles: SMILES string of the molecule
+            batch: Input batch
+            batch_idx: Index of the batch
 
         Returns:
-            Dictionary with prediction results, including latent vector and property predictions
+            Loss tensor
         """
-        from src.utils.smiles_utils import smiles_to_model_input
+        # Forward pass
+        outputs = self.forward(batch)
 
-        # Convert SMILES to model input format
-        with torch.no_grad():
-            # Process to get graph representation
-            try:
-                inputs = smiles_to_model_input(smiles, max_atoms=self.max_nodes)
+        # Compute loss
+        loss_dict = self.compute_loss(
+            batch,
+            (outputs["node_features"], outputs["edge_index"], outputs["edge_features"]),
+            outputs["z_mean"],
+            outputs["z_logvar"],
+        )
 
-                # Move inputs to the same device as the model
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Log losses
+        self.log("test_loss", loss_dict["loss"], on_step=False, on_epoch=True)
+        self.log(
+            "test_recon_loss", loss_dict["recon_loss"], on_step=False, on_epoch=True
+        )
+        self.log("test_kl_loss", loss_dict["kl_loss"], on_step=False, on_epoch=True)
 
-                # Get predictions
-                outputs = self(inputs)
-
-                # Add SMILES to outputs for reference
-                outputs["smiles"] = smiles
-
-                # Extract PAMPA prediction if property_prediction is enabled
-                if self.property_prediction and outputs["prop_pred"] is not None:
-                    # Get the first property (PAMPA)
-                    pampa_pred = outputs["prop_pred"][0, 0].item()
-                    outputs["pampa_prediction"] = pampa_pred
-
-                return outputs
-
-            except Exception as e:
-                raise ValueError(f"Error predicting from SMILES {smiles}: {str(e)}")
-
-    def predict_pampa(self, smiles: str) -> float:
-        """
-        Predict PAMPA permeability for a molecule.
-
-        Args:
-            smiles: SMILES string of the molecule
-
-        Returns:
-            Predicted PAMPA value as a float
-        """
-        outputs = self.predict_from_smiles(smiles)
-
-        if "pampa_prediction" in outputs:
-            return outputs["pampa_prediction"]
-
-        # If property prediction is not enabled or failed
-        raise ValueError("Property prediction failed or not enabled for this model")
-
-    def _get_steps_per_epoch(self):
-        """Dynamically calculate steps per epoch based on dataloader."""
-        if self._steps_per_epoch is None:
-            try:
-                # Try to get the dataloader length from the trainer
-                dataloader = self.trainer.train_dataloader()
-                self._steps_per_epoch = len(dataloader)
-                print(f"Determined steps_per_epoch: {self._steps_per_epoch}")
-            except Exception as e:
-                # Fallback to a reasonable default if not available
-                self._steps_per_epoch = 100
-                print(
-                    f"Warning: Could not determine steps_per_epoch due to {str(e)}, using default value of 100"
-                )
-        return self._steps_per_epoch
+        return loss_dict["loss"]
 
     def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler."""
-        # Create optimizer
+        # Use AdamW with weight decay
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            self.parameters(), lr=self.learning_rate, weight_decay=0.01
         )
 
-        # Calculate steps_per_epoch for the scheduler
-        steps_per_epoch = self._get_steps_per_epoch()
-
-        # Calculate total steps based on trainer max_epochs
-        max_epochs = (
-            self.trainer.max_epochs if hasattr(self.trainer, "max_epochs") else 10
-        )
-        total_steps = steps_per_epoch * max_epochs
-
-        # Create OneCycleLR scheduler
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=self.learning_rate,
-            total_steps=total_steps,
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1000.0,
-            anneal_strategy="cos",
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
         )
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "train_loss"},
         }
 
-    def _warmup_mps(self):
-        """Perform warmup computations to activate and cache kernels on MPS."""
-        if self.mps_warmup_done or not torch.backends.mps.is_available():
-            return
-
-        try:
-            print(
-                f"MPS warmup with node_features={self.node_features}, edge_features={self.edge_features}"
-            )
-
-            # Create small examples for warmup - use appropriate shapes
-            # For encoder: Create a small graph with 10 nodes
-            num_nodes = 10
-            dummy_batch_size = 2
-
-            # Node features
-            x = torch.randn(num_nodes, self.node_features, device="mps")
-
-            # Create edges - simple edge list connecting some nodes
-            edge_index = torch.tensor(
-                [[0, 1, 1, 2, 2, 3, 3, 4, 4, 5], [1, 0, 2, 1, 3, 2, 4, 3, 5, 4]],
-                device="mps",
-            )
-
-            # Edge features if applicable
-            edge_attr = None
-            if self.edge_features > 0:
-                edge_attr = torch.randn(
-                    edge_index.size(1), self.edge_features, device="mps"
-                )
-
-            # Batch indices - assign first 5 nodes to batch 0, next 5 to batch 1
-            batch = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], device="mps")
-
-            # Run encoder to warmup
-            with torch.no_grad():
-                # Encode
-                mu, logvar = self.encoder(x, edge_index, edge_attr, batch)
-
-                # Sample latent
-                z = self.reparameterize(mu, logvar)
-
-                # Decode - with batch size 2
-                _ = self.decoder(z, dummy_batch_size)
-
-                # Property prediction if enabled
-                if self.property_prediction:
-                    _ = self.property_predictor(z)
-
-            # Clear cache after warmup
-            torch.mps.empty_cache()
-            self.mps_warmup_done = True
-            print("MPS warmup completed successfully")
-
-        except Exception as e:
-            print(f"MPS warmup failed: {str(e)}")
-            # Continue even if warmup fails - it's just an optimization
-
-    def predict_properties(self, batch):
+    def predict_pampa(self, smiles):
         """
-        Predict properties for a batch of molecules.
+        Predict PAMPA permeability for a given SMILES string.
 
         Args:
-            batch: Dictionary with keys 'x', 'edge_index', 'edge_attr', etc.
-                  or a PyG Data object
+            smiles: SMILES string of the molecule
 
         Returns:
-            Property predictions tensor
+            Predicted PAMPA value (float)
         """
-        if not self.property_prediction:
-            raise ValueError("Model was not trained with property prediction enabled")
+        from src.utils.smiles_utils import smiles_to_model_input
 
-        # Get latent representation
-        outputs = self(batch)
-        z = outputs["z"]
+        # Put model in evaluation mode
+        self.eval()
 
-        # Apply feature attention if enabled
-        if self.use_feature_attention:
-            z = self.apply_feature_attention(z)
+        # Convert SMILES to model input
+        try:
+            # Convert SMILES to model inputs
+            with torch.no_grad():
+                # Get molecule graph data from SMILES
+                mol_data = smiles_to_model_input(smiles)
 
-        # Get property predictions
-        return self.property_predictor(z)
+                if mol_data is None:
+                    print(f"Could not convert SMILES to molecular graph: {smiles}")
+                    return None
+
+                # Move data to model device
+                device = next(self.parameters()).device
+                for key, value in mol_data.items():
+                    if isinstance(value, torch.Tensor):
+                        mol_data[key] = value.to(device)
+
+                # Forward pass through encoder to get latent representation
+                z_mean, _ = self.encode(mol_data)
+
+                # If property predictor is available, predict property
+                if self.property_predictor is not None:
+                    # Get property prediction from latent space
+                    prop_pred, _ = self.property_predictor(z_mean)
+
+                    # Return the predicted value as a float
+                    return prop_pred.item()
+                else:
+                    print("Property predictor not available")
+                    return None
+
+        except Exception as e:
+            print(f"Error predicting PAMPA for SMILES {smiles}: {str(e)}")
+            return None

@@ -1,50 +1,21 @@
 """
-Comprehensive script for training and evaluating the Graph VAE model.
-
-This script handles:
-1. Data loading and preparation
-2. Model initialization and training
-3. Model evaluation with metrics
-4. Visualization of results and latent space
+Training and evaluation script for the Graph VAE model.
 """
 
 import os
-import argparse
+from typing import Dict, Any, Tuple
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
-import pandas as pd
-import torch.nn.functional as F
-from typing import Dict, Any, Tuple
 
-from src.config import get_config, config_from_args
+from src.utils.device_utils import get_device, optimize_for_device
 from src.models.graph_vae import GraphVAE
 from src.data.data_module import MoleculeDataModule
-from src.utils.training_utils import set_seed
-from src.utils.model_utils import (
-    get_best_checkpoint,
-    load_model_from_checkpoint,
-    batch_predict,
-    count_trainable_parameters,
-)
-from src.utils.metrics_utils import (
-    calculate_regression_metrics,
-    calculate_molecular_metrics,
-    MetricsTracker,
-)
-from src.utils.visualization_utils import (
-    visualize_latent_space,
-    visualize_molecules_grid,
-    plot_training_history,
-    plot_property_correlations,
-)
-from src.utils.augmentation_utils import augment_smiles
 
 
-def train_model(config, output_dir):
+def train_model(
+    config: Any, output_dir: str
+) -> Tuple[GraphVAE, MoleculeDataModule, str]:
     """
     Train the Graph VAE model.
 
@@ -59,7 +30,20 @@ def train_model(config, output_dir):
     print("TRAINING MODEL")
     print("=" * 50)
 
-    # Initialize data module
+    # Get the optimal device and optimization parameters
+    device = get_device()
+    device_params = optimize_for_device(device)
+
+    # Update config with device-specific parameters
+    config.data.batch_size = int(device_params["batch_size"])
+    config.data.num_workers = int(device_params["num_workers"])
+    config.data.pin_memory = bool(device_params["pin_memory"])
+    config.data.prefetch_factor = int(device_params["prefetch_factor"])
+    config.training.learning_rate = float(device_params["learning_rate"])
+    config.training.use_amp = bool(device_params["use_amp"])
+    config.training.gradient_clip = float(device_params["gradient_clip"])
+
+    # Initialize data module with optimized parameters
     data_module = MoleculeDataModule(
         data_path=config.data.data_path,
         smiles_col=config.data.smiles_col,
@@ -69,14 +53,8 @@ def train_model(config, output_dir):
         num_workers=config.data.num_workers,
         max_atoms=config.data.max_atoms,
         seed=config.data.random_seed,
-        pin_memory=(
-            config.data.pin_memory if hasattr(config.data, "pin_memory") else True
-        ),
-        prefetch_factor=(
-            config.data.prefetch_factor
-            if hasattr(config.data, "prefetch_factor")
-            else 2
-        ),
+        pin_memory=config.data.pin_memory,
+        prefetch_factor=config.data.prefetch_factor,
         filter_pampa=(
             config.data.filter_pampa if hasattr(config.data, "filter_pampa") else False
         ),
@@ -100,32 +78,30 @@ def train_model(config, output_dir):
     print(f"Edge features: {edge_features}")
     print(f"Global features: {global_features}")
 
-    # Create model
+    # Create model with device-specific optimizations
     model = GraphVAE(
         node_features=node_features,
         edge_features=edge_features,
         hidden_dim=config.model.hidden_dim,
         latent_dim=config.model.latent_dim,
-        learning_rate=config.training.learning_rate,
-        weight_decay=config.model.weight_decay,
-        property_prediction=config.model.property_prediction,
-        num_properties=(
-            len(config.data.property_cols) if config.data.property_cols else 0
-        ),
-        beta=config.model.beta,
         max_nodes=config.data.max_atoms,
-        global_features=global_features,
-        use_huber_loss=(
-            config.model.use_huber_loss
-            if hasattr(config.model, "use_huber_loss")
+        dropout=config.model.dropout if hasattr(config.model, "dropout") else 0.2,
+        use_edge_features=(
+            config.model.use_edge_features
+            if hasattr(config.model, "use_edge_features")
+            else True
+        ),
+        use_enhanced_features=(
+            config.model.use_enhanced_features
+            if hasattr(config.model, "use_enhanced_features")
             else False
         ),
-        use_feature_attention=(
-            config.model.use_feature_attention
-            if hasattr(config.model, "use_feature_attention")
+        property_prediction=(
+            config.model.property_prediction
+            if hasattr(config.model, "property_prediction")
             else False
         ),
-        batch_size=config.data.batch_size,
+        use_mps_optimizations=(device.type == "mps"),
     )
 
     print(
@@ -154,47 +130,24 @@ def train_model(config, output_dir):
 
     callbacks = [checkpoint_callback, early_stop_callback]
 
-    # Create trainer
+    # Create trainer with device-specific settings
     trainer_kwargs = {
         "max_epochs": config.training.max_epochs,
-        "accelerator": "mps" if torch.backends.mps.is_available() else "auto",
+        "accelerator": device.type,
         "devices": 1,
         "callbacks": callbacks,
         "logger": False,  # No TensorBoard logger
+        "gradient_clip_val": config.training.gradient_clip,
+        "precision": "16-mixed" if config.training.use_amp else "32",
     }
-
-    # Add gradient clipping if specified
-    if hasattr(config.training, "gradient_clip_val"):
-        trainer_kwargs["gradient_clip_val"] = config.training.gradient_clip_val
-
-    # Add accumulate_grad_batches if specified
-    if hasattr(config.training, "accumulate_grad_batches"):
-        trainer_kwargs["accumulate_grad_batches"] = (
-            config.training.accumulate_grad_batches
-        )
-
-    # Add val_check_interval if specified
-    if hasattr(config.training, "val_check_interval"):
-        trainer_kwargs["val_check_interval"] = config.training.val_check_interval
 
     trainer = pl.Trainer(**trainer_kwargs)
 
-    # Train model
-    print(f"Starting training for {config.training.max_epochs} epochs")
+    # Train the model
     trainer.fit(model, data_module)
 
-    # Save final model
-    final_path = os.path.join(checkpoint_dir, "final_model.ckpt")
-    trainer.save_checkpoint(final_path)
-    print(f"Saved final model to {final_path}")
-
-    # Get path to best model
+    # Get the best model path
     best_model_path = checkpoint_callback.best_model_path
-    if best_model_path:
-        print(f"Best model path: {best_model_path}")
-    else:
-        best_model_path = final_path
-        print(f"No best model found, using final model: {best_model_path}")
 
     return model, data_module, best_model_path
 
@@ -279,7 +232,7 @@ def evaluate_model(model, data_module, output_dir):
 
     # Create a trainer for testing
     trainer = pl.Trainer(
-        accelerator="mps" if torch.backends.mps.is_available() else "auto",
+        accelerator="cpu",  # Force CPU usage
         devices=1,
         logger=False,
     )

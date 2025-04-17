@@ -10,7 +10,7 @@ from typing import List, Optional
 import pytorch_lightning as pl
 
 from src.models.graph_vae import GraphVAE
-from src.utils.smiles_to_features import smiles_to_graph_data, batch_smiles_to_features
+from src.utils.smiles_to_features import batch_smiles_to_features
 
 
 def load_model(checkpoint_path: str) -> GraphVAE:
