@@ -1,50 +1,63 @@
-# GraphPermT: Graph VAE Transformer for Peptide Permeability Prediction
+# GVPermformer
 
-This project focuses on predicting the permeability of cyclic peptides using graph-based deep learning approaches. The model combines a Graph Variational Autoencoder (VAE) with transformer architecture to capture complex relationships between peptide structures and their permeability properties.
+A Graph Vision Transformer with Permutation-based Architecture.
 
 ## Project Structure
 
 ```
-├── notebooks/            # Jupyter notebooks for exploration and visualization
-├── src/
-│   ├── data/             # Data loading and preprocessing modules
-│   ├── features/         # Feature engineering and molecular representation
-│   ├── models/           # Graph VAE transformer model implementation
-│   ├── utils/            # Utility functions and helper modules
-│   └── visualization/    # Visualization tools for model performance
-└── training_data/        # Raw training data
+GVPermformer/
+├── configs/           # Configuration files
+├── src/              # Source code
+├── scripts/          # Utility scripts
+├── training_data/    # Training data
+├── tests/            # Test files
+└── requirements.txt  # Project dependencies
 ```
 
-## Installation
+## Setup
+
+1. Create a virtual environment:
+
+```bash
+python -m venv venv
+source venv/bin/activate  # On Unix/macOS
+# or
+.\venv\Scripts\activate  # On Windows
+```
+
+2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+## Development
 
-1. Data preprocessing and feature engineering:
+This project follows:
 
-```bash
-python src/data/preprocess.py
-```
+- PEP 8 style guide
+- Type hints (checked with mypy)
+- Black code formatting
+- Flake8 linting
+- isort import sorting
 
-2. Train the model:
-
-```bash
-python src/models/train.py
-```
-
-3. Evaluate model performance:
+To run code quality checks:
 
 ```bash
-python src/models/evaluate.py
+black .
+isort .
+flake8
+mypy .
 ```
 
-## Apple Metal Support
+## Testing
 
-This project leverages Apple Metal for GPU acceleration on Mac devices. Make sure you have the appropriate PyTorch version installed with MPS support.
+Run tests with pytest:
+
+```bash
+pytest
+```
 
 ## License
 
-MIT
+See the LICENSE file for details.

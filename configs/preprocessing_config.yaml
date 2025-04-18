@@ -1,0 +1,32 @@
+data:
+  input_file: "training_data/CycPeptMPDB_cleaned.csv"
+  smiles_column: "SMILES"
+  target_column: "PAMPA"
+  delimiter: "|"
+
+splits:
+  train_size: 0.7
+  val_size: 0.15
+  test_size: 0.15
+  random_state: 42
+  stratify: true
+
+featurization:
+  graph_conv:
+    use_edges: true
+    use_chirality: true
+    use_partial_charge: false
+  rdkit_descriptors:
+    include_experimental: false
+    use_fragments: true
+
+custom_features:
+  compute_amide_bonds: true
+  compute_ring_size: true
+  compute_amino_acid_composition: true
+  compute_charge_features: true
+
+preprocessing:
+  normalize_features: true
+  scale_method: "standard" # options: standard, minmax, robust
+  handle_missing: "median" # options: mean, median, constant

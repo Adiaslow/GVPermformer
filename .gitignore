@@ -187,3 +187,11 @@ model_outputs/
 # Data
 training_data/
 processed_cycpept_data/
+
+*.csv
+
+data/
+evaluation_results/
+
+models/
+
